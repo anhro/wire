@@ -635,6 +635,93 @@ func (oc *objectCache) processNewSet(info *types.Info, pkgPath string, call *ast
 	return pset, nil
 }
 
+func (oc *objectCache) upgradeSet(set *ProviderSet, setMap map[types.Type][]*ProviderSet) []error {
+	ec := new(errorCollector)
+	usedMap := new(typeutil.Map)
+	for _, typ := range set.providerMap.Keys() {
+		pv := set.For(typ)
+		if !pv.IsProvider() {
+			continue
+		}
+		if pv.Provider().IsStruct {
+			continue
+		}
+		errs := oc.upgradeSetByType(set, typ, setMap, usedMap)
+		if len(errs) > 0 {
+			ec.add(errs...)
+		}
+	}
+	if len(ec.errors) > 0 {
+		return ec.errors
+	}
+	if errs := verifyAcyclic(set.providerMap, oc.hasher); len(errs) > 0 {
+		return errs
+	}
+	return nil
+}
+
+func (oc *objectCache) upgradeSetByProviderArgs(set *ProviderSet, args []ProviderInput, setMap map[types.Type][]*ProviderSet, usedMap *typeutil.Map) []error {
+	ec := new(errorCollector)
+	for i := len(args) - 1; i >= 0; i-- {
+		a := args[i]
+		errs := oc.upgradeSetByType(set, a.Type, setMap, usedMap)
+		if len(errs) > 0 {
+			ec.add(errs...)
+		}
+	}
+	if len(ec.errors) > 0 {
+		return ec.errors
+	}
+	return nil
+}
+
+func (oc *objectCache) upgradeSetByType(set *ProviderSet, typ types.Type, setMap map[types.Type][]*ProviderSet, usedMap *typeutil.Map) []error {
+	ec := new(errorCollector)
+	if usedMap.At(typ) != nil {
+		return nil
+	}
+	usedMap.Set(typ, 0)
+	defer usedMap.Delete(typ)
+	setArray, ok := setMap[typ]
+	if !ok {
+		return nil
+	}
+	if len(setArray) > 1 {
+		err := fmt.Errorf("cannot use set by type, number of sets for the type %v more than one", typ)
+		ec.add(err)
+		return ec.errors
+	}
+	typeSet := setArray[0]
+	for _, keyType := range typeSet.providerMap.Keys() {
+		pt := set.For(keyType)
+		if pt.IsNil() {
+			pv := typeSet.For(typ)
+			if pv.IsProvider() {
+				p := pv.Provider()
+				set.Providers = append(set.Providers, p)
+				src := &providerSetSrc{Provider: p}
+				set.providerMap.Set(typ, &ProvidedType{t: typ, p: p})
+				set.srcMap.Set(typ, src)
+			}
+		}
+		pv := set.For(typ)
+		if pv.IsProvider() {
+			p := pv.Provider()
+			if !p.IsStruct {
+				errs := oc.upgradeSetByProviderArgs(set, p.Args, setMap, usedMap)
+				if len(errs) > 0 {
+					ec.add(errs...)
+				}
+			}
+		}
+		oc.upgradeSetByType(set, keyType, setMap, usedMap)
+	}
+	if len(ec.errors) > 0 {
+		return ec.errors
+	}
+	return nil
+}
+
 // structArgType attempts to interpret an expression as a simple struct type.
 // It assumes any parentheses have been stripped.
 func structArgType(info *types.Info, expr ast.Expr) *types.TypeName {

@@ -68,6 +68,29 @@ type GenerateOptions struct {
 	Tags             string
 }
 
+// InjectorsInfo holds injectors info.
+type InjectorsInfo struct {
+	setMap map[types.Type][]*ProviderSet
+	files  []*InjectorFileInfo
+}
+
+// InjectorFileInfo holds injector file info.
+type InjectorFileInfo struct {
+	file      *ast.File
+	fileName  string
+	injectors []InjectorInfo
+}
+
+// InjectorInfo holds injector info.
+type InjectorInfo struct {
+	call    *ast.CallExpr
+	args    *InjectorArgs
+	fn      *ast.FuncDecl
+	pkgPath string
+	sig     *types.Signature
+	set     *ProviderSet
+}
+
 // Generate performs dependency injection for the packages that match the given
 // patterns, return a GenerateResult for each package. The package pattern is
 // defined by the underlying build system. For the go tool, this is described at
@@ -137,7 +160,24 @@ func detectOutputDir(paths []string) (string, error) {
 // generateInjectors generates the injectors for a given package.
 func generateInjectors(g *gen, pkg *packages.Package) (injectorFiles []*ast.File, _ []error) {
 	oc := newObjectCache([]*packages.Package{pkg})
-	injectorFiles = make([]*ast.File, 0, len(pkg.Syntax))
+	injectorsInfo, errs := buildInjectorsInfo(g, pkg, oc)
+	if len(errs) > 0 {
+		return nil, errs
+	}
+	injectorFiles, errs = generateInjectorsCode(g, pkg, oc, injectorsInfo)
+	if len(errs) > 0 {
+		return nil, errs
+	}
+	return injectorFiles, nil
+}
+
+// buildInjectorsInfo builds the injector info.
+func buildInjectorsInfo(g *gen, pkg *packages.Package, oc *objectCache) (info *InjectorsInfo, _ []error) {
+	var currFile *InjectorFileInfo
+	info = &InjectorsInfo{
+		setMap: make(map[types.Type][]*ProviderSet),
+		files:  make([]*InjectorFileInfo, 0, len(pkg.Syntax)),
+	}
 	ec := new(errorCollector)
 	for _, f := range pkg.Syntax {
 		for _, decl := range f.Decls {
@@ -153,12 +193,15 @@ func generateInjectors(g *gen, pkg *packages.Package) (injectorFiles []*ast.File
 			if buildCall == nil {
 				continue
 			}
-			if len(injectorFiles) == 0 || injectorFiles[len(injectorFiles)-1] != f {
+			if len(info.files) == 0 || info.files[len(info.files)-1].file != f {
 				// This is the first injector generated for this file.
-				// Write a file header.
 				name := filepath.Base(g.pkg.Fset.File(f.Pos()).Name())
-				g.p("// Injectors from %s:\n\n", name)
-				injectorFiles = append(injectorFiles, f)
+				currFile = &InjectorFileInfo{
+					file:      f,
+					fileName:  name,
+					injectors: make([]InjectorInfo, 0, len(f.Decls)),
+				}
+				info.files = append(info.files, currFile)
 			}
 			sig := pkg.TypesInfo.ObjectOf(fn.Name).Type().(*types.Signature)
 			ins, _, err := injectorFuncSignature(sig)
@@ -180,18 +223,74 @@ func generateInjectors(g *gen, pkg *packages.Package) (injectorFiles []*ast.File
 				ec.add(notePositionAll(g.pkg.Fset.Position(fn.Pos()), errs)...)
 				continue
 			}
+			injectSig, err := funcOutput(sig)
+			if err != nil {
+				ec.add(notePosition(g.pkg.Fset.Position(fn.Pos()), fmt.Errorf("inject %s: %v", fn.Name.Name, err)))
+			}
+			setArray, ok := info.setMap[injectSig.out]
+			if !ok {
+				setArray = make([]*ProviderSet, 0)
+				setArray = append(setArray, set)
+			} else {
+				setArray = append(setArray, set)
+			}
+			info.setMap[injectSig.out] = setArray
+			injectorInfo := InjectorInfo{
+				call:    buildCall,
+				args:    injectorArgs,
+				fn:      fn,
+				pkgPath: pkg.PkgPath,
+				sig:     sig,
+				set:     set,
+			}
+			currFile.injectors = append(currFile.injectors, injectorInfo)
+		}
+	}
+	if len(ec.errors) > 0 {
+		return nil, ec.errors
+	}
+	return info, nil
+}
+
+// generateInjectorsCode generates injectors code for a given package.
+func generateInjectorsCode(
+	g *gen,
+	pkg *packages.Package,
+	oc *objectCache,
+	info *InjectorsInfo,
+) (injectorFiles []*ast.File, _ []error) {
+	injectorFiles = make([]*ast.File, 0, len(pkg.Syntax))
+	ec := new(errorCollector)
+	for i := range info.files {
+		file := info.files[i]
+		if len(file.injectors) == 0 {
+			continue
+		}
+		// Write a file header.
+		g.p("// Injectors from %s:\n\n", file.fileName)
+		injectorFiles = append(injectorFiles, file.file)
+		for j := range file.injectors {
+			injector := &file.injectors[j]
+			fn := injector.fn
+			sig := injector.sig
+			set := injector.set
+			errs := oc.upgradeSet(set, info.setMap)
+			if len(errs) > 0 {
+				ec.add(notePositionAll(g.pkg.Fset.Position(fn.Pos()), errs)...)
+				continue
+			}
 			if errs := g.inject(fn.Pos(), fn.Name.Name, sig, set, fn.Doc); len(errs) > 0 {
 				ec.add(errs...)
 				continue
 			}
 		}
-
-		for _, impt := range f.Imports {
+		for _, impt := range file.file.Imports {
 			if impt.Name != nil && impt.Name.Name == "_" {
 				g.anonImports[impt.Path.Value] = true
 			}
 		}
 	}
+
 	if len(ec.errors) > 0 {
 		return nil, ec.errors
 	}
