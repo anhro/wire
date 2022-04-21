@@ -103,7 +103,13 @@ type InjectorInfo struct {
 // takes precedence.
 //
 // Generate may return one or more errors if it failed to load the packages.
-func Generate(ctx context.Context, wd string, env []string, patterns []string, opts *GenerateOptions) ([]GenerateResult, []error) {
+func Generate(
+	ctx context.Context,
+	wd string,
+	env []string,
+	patterns []string,
+	opts *GenerateOptions,
+) ([]GenerateResult, []error) {
 	if opts == nil {
 		opts = &GenerateOptions{}
 	}
@@ -274,11 +280,11 @@ func generateInjectorsCode(
 			fn := injector.fn
 			sig := injector.sig
 			set := injector.set
-			errs := oc.upgradeSet(set, info.setMap)
-			if len(errs) > 0 {
-				ec.add(notePositionAll(g.pkg.Fset.Position(fn.Pos()), errs)...)
-				continue
-			}
+			//errs := oc.upgradeSet(set, info.setMap)
+			//if len(errs) > 0 {
+			//	ec.add(notePositionAll(g.pkg.Fset.Position(fn.Pos()), errs)...)
+			//	continue
+			//}
 			if errs := g.inject(fn.Pos(), fn.Name.Name, sig, set, fn.Doc); len(errs) > 0 {
 				ec.add(errs...)
 				continue
@@ -407,11 +413,19 @@ func (g *gen) frame(tags string) []byte {
 }
 
 // inject emits the code for an injector.
-func (g *gen) inject(pos token.Pos, name string, sig *types.Signature, set *ProviderSet, doc *ast.CommentGroup) []error {
+func (g *gen) inject(
+	pos token.Pos,
+	name string,
+	sig *types.Signature,
+	set *ProviderSet,
+	doc *ast.CommentGroup,
+) []error {
 	injectSig, err := funcOutput(sig)
 	if err != nil {
-		return []error{notePosition(g.pkg.Fset.Position(pos),
-			fmt.Errorf("inject %s: %v", name, err))}
+		return []error{
+			notePosition(g.pkg.Fset.Position(pos),
+				fmt.Errorf("inject %s: %v", name, err)),
+		}
 	}
 	params := sig.Params()
 	calls, errs := solve(g.pkg.Fset, injectSig.out, params, set)
@@ -436,7 +450,8 @@ func (g *gen) inject(pos token.Pos, name string, sig *types.Signature, set *Prov
 			ts := types.TypeString(c.out, nil)
 			ec.add(notePosition(
 				g.pkg.Fset.Position(pos),
-				fmt.Errorf("inject %s: provider for %s returns cleanup but injection does not return cleanup function", name, ts)))
+				fmt.Errorf("inject %s: provider for %s returns cleanup but injection does not return cleanup function",
+					name, ts)))
 		}
 		if c.hasErr && !injectSig.err {
 			ts := types.TypeString(c.out, nil)
@@ -455,7 +470,8 @@ func (g *gen) inject(pos token.Pos, name string, sig *types.Signature, set *Prov
 			if g.values[c.valueExpr] == "" {
 				t := c.valueTypeInfo.TypeOf(c.valueExpr)
 
-				name := typeVariableName(t, "", func(name string) string { return "_wire" + export(name) + "Value" }, g.nameInFileScope)
+				name := typeVariableName(t, "", func(name string) string { return "_wire" + export(name) + "Value" },
+					g.nameInFileScope)
 				g.values[c.valueExpr] = name
 				pendingVars = append(pendingVars, pendingVar{
 					name:     name,
@@ -689,7 +705,14 @@ type injectorGen struct {
 
 // injectPass generates an injector given the output from analysis.
 // The sig passed in should be verified.
-func injectPass(name string, sig *types.Signature, calls []call, set *ProviderSet, doc *ast.CommentGroup, ig *injectorGen) {
+func injectPass(
+	name string,
+	sig *types.Signature,
+	calls []call,
+	set *ProviderSet,
+	doc *ast.CommentGroup,
+	ig *injectorGen,
+) {
 	params := sig.Params()
 	injectSig, err := funcOutput(sig)
 	if err != nil {
@@ -909,7 +932,12 @@ func zeroValue(t types.Type, qf types.Qualifier) string {
 // collides is used to see if a name is ambiguous. If any one of the derived
 // names is unambiguous, it used; otherwise, the first derived name is
 // disambiguated using disambiguate().
-func typeVariableName(t types.Type, defaultName string, transform func(string) string, collides func(string) bool) string {
+func typeVariableName(
+	t types.Type,
+	defaultName string,
+	transform func(string) string,
+	collides func(string) bool,
+) string {
 	if p, ok := t.(*types.Pointer); ok {
 		t = p.Elem()
 	}
