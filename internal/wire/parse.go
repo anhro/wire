@@ -65,7 +65,8 @@ func (p *providerSetSrc) description(fset *token.FileSet, typ types.Type) string
 		return fmt.Sprintf("provider set %s(%s)", quoted(p.Import.VarName), fset.Position(p.Import.Pos))
 	case p.InjectorArg != nil:
 		args := p.InjectorArg.Args
-		return fmt.Sprintf("argument %s to injector function %s (%s)", args.Tuple.At(p.InjectorArg.Index).Name(), args.Name, fset.Position(args.Pos))
+		return fmt.Sprintf("argument %s to injector function %s (%s)", args.Tuple.At(p.InjectorArg.Index).Name(),
+			args.Name, fset.Position(args.Pos))
 	case p.Field != nil:
 		return fmt.Sprintf("wire.FieldsOf (%s)", fset.Position(p.Field.Pos))
 	}
@@ -521,7 +522,10 @@ func (oc *objectCache) varDecl(obj *types.Var) *ast.ValueSpec {
 
 // processExpr converts an expression into a Wire structure. It may return a
 // *Provider, an *IfaceBinding, a *ProviderSet, a *Value or a []*Field.
-func (oc *objectCache) processExpr(info *types.Info, pkgPath string, expr ast.Expr, varName string) (interface{}, []error) {
+func (oc *objectCache) processExpr(info *types.Info, pkgPath string, expr ast.Expr, varName string) (
+	interface{},
+	[]error,
+) {
 	exprPos := oc.fset.Position(expr.Pos())
 	expr = astutil.Unparen(expr)
 	if obj := qualifiedIdentObject(info, expr); obj != nil {
@@ -590,7 +594,13 @@ func (oc *objectCache) processExpr(info *types.Info, pkgPath string, expr ast.Ex
 	return nil, []error{notePosition(exprPos, errors.New("unknown pattern"))}
 }
 
-func (oc *objectCache) processNewSet(info *types.Info, pkgPath string, call *ast.CallExpr, args *InjectorArgs, varName string) (*ProviderSet, []error) {
+func (oc *objectCache) processNewSet(
+	info *types.Info,
+	pkgPath string,
+	call *ast.CallExpr,
+	args *InjectorArgs,
+	varName string,
+) (*ProviderSet, []error) {
 	// Assumes that call.Fun is wire.NewSet or wire.Build.
 
 	pset := &ProviderSet{
@@ -635,18 +645,26 @@ func (oc *objectCache) processNewSet(info *types.Info, pkgPath string, call *ast
 	return pset, nil
 }
 
-func (oc *objectCache) upgradeSet(set *ProviderSet, setMap map[types.Type][]*ProviderSet) []error {
+func (oc *objectCache) upgradeSet(set *ProviderSet, setMap *typeutil.Map) []error {
 	ec := new(errorCollector)
 	usedMap := new(typeutil.Map)
-	for _, typ := range set.providerMap.Keys() {
+	usedMap.SetHasher(oc.hasher)
+	for _, imp := range set.Imports {
+		sets := []*ProviderSet{set, imp}
+		for _, p := range imp.Providers {
+			typ := p.Out[0]
+			pv := set.For(typ)
+			errs := oc.upgradeSetByType(sets, typ, pv.t, setMap, usedMap)
+			if len(errs) > 0 {
+				ec.add(errs...)
+			}
+		}
+	}
+	sets := []*ProviderSet{set}
+	for _, p := range set.Providers {
+		typ := p.Out[0]
 		pv := set.For(typ)
-		if !pv.IsProvider() {
-			continue
-		}
-		if pv.Provider().IsStruct {
-			continue
-		}
-		errs := oc.upgradeSetByType(set, typ, setMap, usedMap)
+		errs := oc.upgradeSetByType(sets, typ, pv.t, setMap, usedMap)
 		if len(errs) > 0 {
 			ec.add(errs...)
 		}
@@ -660,11 +678,16 @@ func (oc *objectCache) upgradeSet(set *ProviderSet, setMap map[types.Type][]*Pro
 	return nil
 }
 
-func (oc *objectCache) upgradeSetByProviderArgs(set *ProviderSet, args []ProviderInput, setMap map[types.Type][]*ProviderSet, usedMap *typeutil.Map) []error {
+func (oc *objectCache) upgradeSetByProviderArgs(
+	sets []*ProviderSet,
+	args []ProviderInput,
+	setMap *typeutil.Map,
+	usedMap *typeutil.Map,
+) []error {
 	ec := new(errorCollector)
-	for i := len(args) - 1; i >= 0; i-- {
+	for i := 0; i < len(args); i++ {
 		a := args[i]
-		errs := oc.upgradeSetByType(set, a.Type, setMap, usedMap)
+		errs := oc.upgradeSetByType(sets, a.Type, a.Type, setMap, usedMap)
 		if len(errs) > 0 {
 			ec.add(errs...)
 		}
@@ -675,46 +698,83 @@ func (oc *objectCache) upgradeSetByProviderArgs(set *ProviderSet, args []Provide
 	return nil
 }
 
-func (oc *objectCache) upgradeSetByType(set *ProviderSet, typ types.Type, setMap map[types.Type][]*ProviderSet, usedMap *typeutil.Map) []error {
+func (oc *objectCache) upgradeSetByType(
+	sets []*ProviderSet,
+	srcType types.Type,
+	providedType types.Type,
+	setMap *typeutil.Map,
+	usedMap *typeutil.Map,
+) []error {
 	ec := new(errorCollector)
-	if usedMap.At(typ) != nil {
+	if usedMap.At(srcType) != nil {
 		return nil
 	}
-	usedMap.Set(typ, 0)
-	defer usedMap.Delete(typ)
-	setArray, ok := setMap[typ]
-	if !ok {
+	usedMap.Set(srcType, 0)
+	defer usedMap.Delete(srcType)
+	setPtr := setMap.At(srcType)
+	if setPtr == nil {
 		return nil
+	}
+	set := sets[0]
+	pt := set.For(srcType)
+	if !pt.IsNil() {
+		if pt.IsProvider() {
+			p := pt.Provider()
+			errs := oc.upgradeSetByProviderArgs(sets, p.Args, setMap, usedMap)
+			if len(errs) > 0 {
+				ec.add(errs...)
+			}
+		}
+		return nil
+	}
+	setArray, ok := setPtr.([]*ProviderSet)
+	if !ok {
+		ec.add(fmt.Errorf("incorrect type want %T real %T", setArray, setPtr))
+		return ec.errors
 	}
 	if len(setArray) > 1 {
-		err := fmt.Errorf("cannot use set by type, number of sets for the type %v more than one", typ)
+		err := fmt.Errorf("cannot use set by type, number of sets for the type %v more than one", providedType)
 		ec.add(err)
 		return ec.errors
 	}
 	typeSet := setArray[0]
-	for _, keyType := range typeSet.providerMap.Keys() {
+	for _, imp := range typeSet.Imports {
+		imp.providerMap.Iterate(func(k types.Type, v interface{}) {
+			localSets := append(sets, imp)
+			errs := oc.upgradeSetByType(localSets, k, k, setMap, usedMap)
+			if len(errs) > 0 {
+				ec.add(errs...)
+			}
+		})
+	}
+	for _, p := range typeSet.Providers {
+		keyType := p.Out[0]
 		pt := set.For(keyType)
 		if pt.IsNil() {
-			pv := typeSet.For(typ)
+			pv := typeSet.For(keyType)
 			if pv.IsProvider() {
 				p := pv.Provider()
-				set.Providers = append(set.Providers, p)
-				src := &providerSetSrc{Provider: p}
-				set.providerMap.Set(typ, &ProvidedType{t: typ, p: p})
-				set.srcMap.Set(typ, src)
-			}
-		}
-		pv := set.For(typ)
-		if pv.IsProvider() {
-			p := pv.Provider()
-			if !p.IsStruct {
-				errs := oc.upgradeSetByProviderArgs(set, p.Args, setMap, usedMap)
-				if len(errs) > 0 {
-					ec.add(errs...)
+				lastSet := sets[len(sets)-1]
+				if lastSet.For(keyType).IsNil() {
+					lastSet.Providers = append(lastSet.Providers, p)
+				}
+				firstSet := sets[0]
+				if firstSet.For(keyType).IsNil() {
+					src := &providerSetSrc{Provider: p}
+					firstSet.providerMap.Set(keyType, &ProvidedType{t: pv.t, p: p})
+					firstSet.srcMap.Set(keyType, src)
 				}
 			}
 		}
-		oc.upgradeSetByType(set, keyType, setMap, usedMap)
+		pv := set.For(keyType)
+		if pv.IsProvider() {
+			p := pv.Provider()
+			errs := oc.upgradeSetByProviderArgs(sets, p.Args, setMap, usedMap)
+			if len(errs) > 0 {
+				ec.add(errs...)
+			}
+		}
+		oc.upgradeSetByType(sets, keyType, pv.t, setMap, usedMap)
 	}
 	if len(ec.errors) > 0 {
 		return ec.errors
@@ -765,7 +825,9 @@ func processFuncProvider(fset *token.FileSet, fn *types.Func) (*Provider, []erro
 	fpos := fn.Pos()
 	providerSig, err := funcOutput(sig)
 	if err != nil {
-		return nil, []error{notePosition(fset.Position(fpos), fmt.Errorf("wrong signature for provider %s: %v", fn.Name(), err))}
+		return nil, []error{
+			notePosition(fset.Position(fpos), fmt.Errorf("wrong signature for provider %s: %v", fn.Name(), err)),
+		}
 	}
 	params := sig.Params()
 	provider := &Provider{
@@ -784,7 +846,10 @@ func processFuncProvider(fset *token.FileSet, fn *types.Func) (*Provider, []erro
 		}
 		for j := 0; j < i; j++ {
 			if types.Identical(provider.Args[i].Type, provider.Args[j].Type) {
-				return nil, []error{notePosition(fset.Position(fpos), fmt.Errorf("provider has multiple parameters of type %s", types.TypeString(provider.Args[j].Type, nil)))}
+				return nil, []error{
+					notePosition(fset.Position(fpos), fmt.Errorf("provider has multiple parameters of type %s",
+						types.TypeString(provider.Args[j].Type, nil))),
+				}
 			}
 		}
 	}
@@ -821,7 +886,8 @@ func funcOutput(sig *types.Signature) (outputSignature, error) {
 		case types.Identical(t, cleanupType):
 			return outputSignature{out: out, cleanup: true}, nil
 		default:
-			return outputSignature{}, fmt.Errorf("second return type is %s; must be error or func()", types.TypeString(t, nil))
+			return outputSignature{}, fmt.Errorf("second return type is %s; must be error or func()",
+				types.TypeString(t, nil))
 		}
 	case 3:
 		if t := results.At(1).Type(); !types.Identical(t, cleanupType) {
@@ -875,7 +941,10 @@ func processStructLiteralProvider(fset *token.FileSet, typeName *types.TypeName)
 		}
 		for j := 0; j < i; j++ {
 			if types.Identical(provider.Args[i].Type, provider.Args[j].Type) {
-				return nil, []error{notePosition(fset.Position(pos), fmt.Errorf("provider struct has multiple fields of type %s", types.TypeString(provider.Args[j].Type, nil)))}
+				return nil, []error{
+					notePosition(fset.Position(pos), fmt.Errorf("provider struct has multiple fields of type %s",
+						types.TypeString(provider.Args[j].Type, nil))),
+				}
 			}
 		}
 	}
@@ -942,7 +1011,9 @@ func processStructProvider(fset *token.FileSet, info *types.Info, call *ast.Call
 		for j := 0; j < i; j++ {
 			if types.Identical(provider.Args[i].Type, provider.Args[j].Type) {
 				f := st.Field(j)
-				return nil, notePosition(fset.Position(f.Pos()), fmt.Errorf("provider struct has multiple fields of type %s", types.TypeString(provider.Args[j].Type, nil)))
+				return nil, notePosition(fset.Position(f.Pos()),
+					fmt.Errorf("provider struct has multiple fields of type %s",
+						types.TypeString(provider.Args[j].Type, nil)))
 			}
 		}
 	}
@@ -980,13 +1051,15 @@ func processBind(fset *token.FileSet, info *types.Info, call *ast.CallExpr) (*If
 	ifacePtr, ok := ifaceArgType.(*types.Pointer)
 	if !ok {
 		return nil, notePosition(fset.Position(call.Pos()),
-			fmt.Errorf("first argument to Bind must be a pointer to an interface type; found %s", types.TypeString(ifaceArgType, nil)))
+			fmt.Errorf("first argument to Bind must be a pointer to an interface type; found %s",
+				types.TypeString(ifaceArgType, nil)))
 	}
 	iface := ifacePtr.Elem()
 	methodSet, ok := iface.Underlying().(*types.Interface)
 	if !ok {
 		return nil, notePosition(fset.Position(call.Pos()),
-			fmt.Errorf("first argument to Bind must be a pointer to an interface type; found %s", types.TypeString(ifaceArgType, nil)))
+			fmt.Errorf("first argument to Bind must be a pointer to an interface type; found %s",
+				types.TypeString(ifaceArgType, nil)))
 	}
 
 	provided := info.TypeOf(call.Args[1])
@@ -994,7 +1067,8 @@ func processBind(fset *token.FileSet, info *types.Info, call *ast.CallExpr) (*If
 		providedPtr, ok := provided.(*types.Pointer)
 		if !ok {
 			return nil, notePosition(fset.Position(call.Args[0].Pos()),
-				fmt.Errorf("second argument to Bind must be a pointer or a pointer to a pointer; found %s", types.TypeString(provided, nil)))
+				fmt.Errorf("second argument to Bind must be a pointer or a pointer to a pointer; found %s",
+					types.TypeString(provided, nil)))
 		}
 		provided = providedPtr.Elem()
 	}
@@ -1048,7 +1122,9 @@ func processValue(fset *token.FileSet, info *types.Info, call *ast.CallExpr) (*V
 	// Result type can't be an interface type; use wire.InterfaceValue for that.
 	argType := info.TypeOf(call.Args[0])
 	if _, isInterfaceType := argType.Underlying().(*types.Interface); isInterfaceType {
-		return nil, notePosition(fset.Position(call.Pos()), fmt.Errorf("argument to Value may not be an interface value (found %s); use InterfaceValue instead", types.TypeString(argType, nil)))
+		return nil, notePosition(fset.Position(call.Pos()),
+			fmt.Errorf("argument to Value may not be an interface value (found %s); use InterfaceValue instead",
+				types.TypeString(argType, nil)))
 	}
 	return &Value{
 		Pos:  call.Args[0].Pos(),
@@ -1063,21 +1139,27 @@ func processInterfaceValue(fset *token.FileSet, info *types.Info, call *ast.Call
 	// Assumes that call.Fun is wire.InterfaceValue.
 
 	if len(call.Args) != 2 {
-		return nil, notePosition(fset.Position(call.Pos()), errors.New("call to InterfaceValue takes exactly two arguments"))
+		return nil, notePosition(fset.Position(call.Pos()),
+			errors.New("call to InterfaceValue takes exactly two arguments"))
 	}
 	ifaceArgType := info.TypeOf(call.Args[0])
 	ifacePtr, ok := ifaceArgType.(*types.Pointer)
 	if !ok {
-		return nil, notePosition(fset.Position(call.Pos()), fmt.Errorf("first argument to InterfaceValue must be a pointer to an interface type; found %s", types.TypeString(ifaceArgType, nil)))
+		return nil, notePosition(fset.Position(call.Pos()),
+			fmt.Errorf("first argument to InterfaceValue must be a pointer to an interface type; found %s",
+				types.TypeString(ifaceArgType, nil)))
 	}
 	iface := ifacePtr.Elem()
 	methodSet, ok := iface.Underlying().(*types.Interface)
 	if !ok {
-		return nil, notePosition(fset.Position(call.Pos()), fmt.Errorf("first argument to InterfaceValue must be a pointer to an interface type; found %s", types.TypeString(ifaceArgType, nil)))
+		return nil, notePosition(fset.Position(call.Pos()),
+			fmt.Errorf("first argument to InterfaceValue must be a pointer to an interface type; found %s",
+				types.TypeString(ifaceArgType, nil)))
 	}
 	provided := info.TypeOf(call.Args[1])
 	if !types.Implements(provided, methodSet) {
-		return nil, notePosition(fset.Position(call.Pos()), fmt.Errorf("%s does not implement %s", types.TypeString(provided, nil), types.TypeString(iface, nil)))
+		return nil, notePosition(fset.Position(call.Pos()),
+			fmt.Errorf("%s does not implement %s", types.TypeString(provided, nil), types.TypeString(iface, nil)))
 	}
 	return &Value{
 		Pos:  call.Args[1].Pos(),
@@ -1121,7 +1203,8 @@ func processFieldsOf(fset *token.FileSet, info *types.Info, call *ast.CallExpr) 
 	}
 	if struc.NumFields() < len(call.Args)-1 {
 		return nil, notePosition(fset.Position(call.Pos()),
-			fmt.Errorf("fields number exceeds the number available in the struct which has %d fields", struc.NumFields()))
+			fmt.Errorf("fields number exceeds the number available in the struct which has %d fields",
+				struc.NumFields()))
 	}
 
 	fields := make([]*Field, 0, len(call.Args)-1)

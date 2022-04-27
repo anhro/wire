@@ -36,6 +36,7 @@ import (
 
 	"golang.org/x/tools/go/ast/astutil"
 	"golang.org/x/tools/go/packages"
+	"golang.org/x/tools/go/types/typeutil"
 )
 
 // GenerateResult stores the result for a package from a call to Generate.
@@ -70,7 +71,7 @@ type GenerateOptions struct {
 
 // InjectorsInfo holds injectors info.
 type InjectorsInfo struct {
-	setMap map[types.Type][]*ProviderSet
+	setMap *typeutil.Map
 	files  []*InjectorFileInfo
 }
 
@@ -180,8 +181,10 @@ func generateInjectors(g *gen, pkg *packages.Package) (injectorFiles []*ast.File
 // buildInjectorsInfo builds the injector info.
 func buildInjectorsInfo(g *gen, pkg *packages.Package, oc *objectCache) (info *InjectorsInfo, _ []error) {
 	var currFile *InjectorFileInfo
+	setMap := new(typeutil.Map)
+	setMap.SetHasher(oc.hasher)
 	info = &InjectorsInfo{
-		setMap: make(map[types.Type][]*ProviderSet),
+		setMap: setMap,
 		files:  make([]*InjectorFileInfo, 0, len(pkg.Syntax)),
 	}
 	ec := new(errorCollector)
@@ -233,14 +236,22 @@ func buildInjectorsInfo(g *gen, pkg *packages.Package, oc *objectCache) (info *I
 			if err != nil {
 				ec.add(notePosition(g.pkg.Fset.Position(fn.Pos()), fmt.Errorf("inject %s: %v", fn.Name.Name, err)))
 			}
-			setArray, ok := info.setMap[injectSig.out]
-			if !ok {
+			setPtr := info.setMap.At(injectSig.out)
+			var setArray []*ProviderSet
+			if setPtr == nil {
 				setArray = make([]*ProviderSet, 0)
 				setArray = append(setArray, set)
 			} else {
+				setArray, ok = setPtr.([]*ProviderSet)
+				if !ok {
+					ec.add(notePosition(g.pkg.Fset.Position(fn.Pos()),
+						fmt.Errorf("inject %s incorrect type want %T real %T: %v", fn.Name.Name, setArray, setPtr,
+							err)))
+					continue
+				}
 				setArray = append(setArray, set)
 			}
-			info.setMap[injectSig.out] = setArray
+			info.setMap.Set(injectSig.out, setArray)
 			injectorInfo := InjectorInfo{
 				call:    buildCall,
 				args:    injectorArgs,
@@ -280,11 +291,11 @@ func generateInjectorsCode(
 			fn := injector.fn
 			sig := injector.sig
 			set := injector.set
-			//errs := oc.upgradeSet(set, info.setMap)
-			//if len(errs) > 0 {
-			//	ec.add(notePositionAll(g.pkg.Fset.Position(fn.Pos()), errs)...)
-			//	continue
-			//}
+			errs := oc.upgradeSet(set, info.setMap)
+			if len(errs) > 0 {
+				ec.add(notePositionAll(g.pkg.Fset.Position(fn.Pos()), errs)...)
+				continue
+			}
 			if errs := g.inject(fn.Pos(), fn.Name.Name, sig, set, fn.Doc); len(errs) > 0 {
 				ec.add(errs...)
 				continue
