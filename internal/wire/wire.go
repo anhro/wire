@@ -252,13 +252,14 @@ func buildInjectorsInfo(g *gen, pkg *packages.Package, oc *objectCache) (info *I
 				setArray = append(setArray, set)
 			}
 			info.setMap.Set(injectSig.out, setArray)
+			buildingSet := *set
 			injectorInfo := InjectorInfo{
 				call:    buildCall,
 				args:    injectorArgs,
 				fn:      fn,
 				pkgPath: pkg.PkgPath,
 				sig:     sig,
-				set:     set,
+				set:     &buildingSet,
 			}
 			currFile.injectors = append(currFile.injectors, injectorInfo)
 		}
