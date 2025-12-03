@@ -2,6 +2,5 @@ github.com/google/subcommands
 github.com/anhro/wire
 github.com/pmezard/go-difflib
 golang.org/x/mod
-golang.org/x/sys
+golang.org/x/sync
 golang.org/x/tools
-golang.org/x/xerrors
